@@ -1,3 +1,3 @@
-export LM_STUDIO_BASE_URL="http://localhost:1234"
+# (legacy) example envs
+export INTERNAL_COMPLETIONS_URL=""
 export LOG_LEVEL=info
-
