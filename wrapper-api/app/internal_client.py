@@ -1,13 +1,18 @@
 from __future__ import annotations
 
+import datetime as dt
 import json
+import os
 import secrets
+import subprocess
+import threading
 import time
 from typing import Any, Iterable, List, Sequence, Tuple
 
 from fastapi import HTTPException, status
 from google import genai
 from google.genai import types as genai_types
+from google.auth.credentials import Credentials as GoogleCredentials
 
 from .schemas import (
     ChatChoice,
@@ -21,33 +26,158 @@ from .schemas import (
     Usage,
 )
 
-# Centralized google-genai client configuration.
 #
-# Put all `genai.Client(...)` configuration in this one place.
-# Examples (uncomment and fill in if you use Vertex AI):
-#   GENAI_CLIENT_KWARGS = {"vertexai": True, "project": "my-gcp-project", "location": "us-central1"}
+# GenAI client configuration (single place).
+#
+# Put your exact `genai.Client(...)` kwargs here (vertexai/project/location/etc).
 GENAI_CLIENT_KWARGS: dict[str, Any] = {}
 
-# Optional default API key for the wrapper. Prefer passing a per-request key via:
-# - `Authorization: Bearer ...`
-# - `x-goog-api-key: ...`
-DEFAULT_GENAI_API_KEY: str | None = None
+# Helix CLI command that prints an access token.
+# - If it's a string, it's run via the shell.
+# - If it's a list, it's executed directly (recommended).
+HELIX_TOKEN_COMMAND: str | Sequence[str] | None = None
+HELIX_TOKEN_TIMEOUT_SECONDS = 15
+HELIX_TOKEN_TTL_SECONDS = 3000
+
+# Optional: path to your router/CA PEM. This is applied to the process env so
+# the underlying HTTP/TLS stack can pick it up.
+SSL_CERT_PEM_PATH: str | None = None
+SSL_CERT_ENV_KEYS: Sequence[str] = (
+    "SSL_CERT_FILE",
+    "REQUESTS_CA_BUNDLE",
+    "SSL_CERT",
+    "SSL CERT",
+)
+
+# Roo/Cline often sends a dummy "API key" in the Authorization header. Ignore it by default.
+ALLOW_REQUEST_API_KEY = False
 
 
-def _init_genai_client(api_key: str | None) -> genai.Client:
-    kwargs = dict(GENAI_CLIENT_KWARGS)
-    if api_key:
-        kwargs["api_key"] = api_key
-    return genai.Client(**kwargs)
+def _run_command(command: str | Sequence[str]) -> str:
+    """Run command and return decoded stdout.
+
+    Uses the `check_output(...).decode().strip()` style expected by your Helix flow.
+    """
+    try:
+        if isinstance(command, str):
+            output = subprocess.check_output(
+                command,
+                shell=True,
+                stderr=subprocess.STDOUT,
+                timeout=HELIX_TOKEN_TIMEOUT_SECONDS,
+            )
+        else:
+            output = subprocess.check_output(
+                list(command),
+                stderr=subprocess.STDOUT,
+                timeout=HELIX_TOKEN_TIMEOUT_SECONDS,
+            )
+    except subprocess.CalledProcessError as exc:  # noqa: BLE001
+        message = (exc.output or b"").decode(errors="replace").strip()
+        raise RuntimeError(f"token command failed (exit {exc.returncode}): {message}") from exc
+
+    stdout = (output or b"").decode(errors="replace").strip()
+    if not stdout:
+        raise RuntimeError("token command returned empty output")
+    return stdout
 
 
-DEFAULT_GENAI_CLIENT = _init_genai_client(DEFAULT_GENAI_API_KEY)
+def _apply_ssl_cert_env() -> None:
+    if not SSL_CERT_PEM_PATH:
+        return
+    for key in SSL_CERT_ENV_KEYS:
+        os.environ[key] = SSL_CERT_PEM_PATH
+
+
+def _fetch_helix_token(command: str | Sequence[str]) -> tuple[str, dt.datetime | None]:
+    _apply_ssl_cert_env()
+    stdout = _run_command(command)
+
+    token = stdout.splitlines()[0].strip()
+    expiry = dt.datetime.utcnow() + dt.timedelta(seconds=HELIX_TOKEN_TTL_SECONDS)
+
+    try:
+        data = json.loads(stdout)
+    except json.JSONDecodeError:
+        data = None
+
+    if isinstance(data, dict) and data.get("access_token"):
+        token = str(data["access_token"]).strip()
+        expires_in = data.get("expires_in")
+        if expires_in is not None:
+            try:
+                expiry = dt.datetime.utcnow() + dt.timedelta(seconds=int(expires_in))
+            except Exception:  # noqa: BLE001
+                pass
+
+    if token.lower().startswith("bearer "):
+        token = token[7:].strip()
+
+    if not token:
+        raise RuntimeError("helix token command did not return a token")
+
+    return token, expiry
+
+
+class HelixTokenCredentials(GoogleCredentials):
+    def __init__(self, command: str | Sequence[str]) -> None:
+        super().__init__()
+        self._command = command
+        self._lock = threading.Lock()
+        self._token: str | None = None
+        self._expiry: dt.datetime | None = None
+
+    @property
+    def token(self) -> str | None:  # type: ignore[override]
+        return self._token
+
+    @property
+    def expiry(self) -> dt.datetime | None:  # type: ignore[override]
+        return self._expiry
+
+    @property
+    def expired(self) -> bool:  # type: ignore[override]
+        if not self._token:
+            return True
+        if self._expiry is None:
+            return False
+        return dt.datetime.utcnow() >= self._expiry
+
+    @property
+    def valid(self) -> bool:  # type: ignore[override]
+        return bool(self._token) and not self.expired
+
+    @property
+    def requires_scopes(self) -> bool:  # type: ignore[override]
+        return False
+
+    def refresh(self, request: Any) -> None:  # type: ignore[override]
+        with self._lock:
+            token, expiry = _fetch_helix_token(self._command)
+            self._token = token
+            self._expiry = expiry
+
+
+_DEFAULT_GENAI_CLIENT: genai.Client | None = None
+_DEFAULT_CLIENT_LOCK = threading.Lock()
 
 
 def get_genai_client(api_key: str | None) -> genai.Client:
-    if not api_key or (DEFAULT_GENAI_API_KEY and api_key == DEFAULT_GENAI_API_KEY):
-        return DEFAULT_GENAI_CLIENT
-    return _init_genai_client(api_key)
+    _apply_ssl_cert_env()
+    if ALLOW_REQUEST_API_KEY and api_key:
+        kwargs = dict(GENAI_CLIENT_KWARGS)
+        kwargs["api_key"] = api_key
+        return genai.Client(**kwargs)
+
+    global _DEFAULT_GENAI_CLIENT
+    if _DEFAULT_GENAI_CLIENT is None:
+        with _DEFAULT_CLIENT_LOCK:
+            if _DEFAULT_GENAI_CLIENT is None:
+                kwargs = dict(GENAI_CLIENT_KWARGS)
+                if HELIX_TOKEN_COMMAND:
+                    kwargs["credentials"] = HelixTokenCredentials(HELIX_TOKEN_COMMAND)
+                _DEFAULT_GENAI_CLIENT = genai.Client(**kwargs)
+    return _DEFAULT_GENAI_CLIENT
 
 
 def _candidate_text(candidate: Any) -> str:
