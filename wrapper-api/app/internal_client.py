@@ -464,21 +464,25 @@ def stream_openai_completion(
     seen_text = ""
     finish_reason: str | None = None
     usage: Usage | None = None
+    stream = _generate_content_stream(
+        client=genai_client,
+        model=request.model,
+        prompt=request.prompt,
+        gen_config=gen_config,
+    )
     try:
-        for chunk in _generate_content_stream(
-            client=genai_client,
-            model=request.model,
-            prompt=request.prompt,
-            gen_config=gen_config,
-        ):
+        for chunk in stream:
             usage = _extract_usage(chunk) or usage
             candidate = (getattr(chunk, "candidates", None) or [None])[0]
             if candidate is None:
                 continue
 
-            finish_reason = _normalize_finish_reason(getattr(candidate, "finish_reason", None)) or finish_reason
+            chunk_finish_reason = _normalize_finish_reason(getattr(candidate, "finish_reason", None))
+            finish_reason = chunk_finish_reason or finish_reason
             current_text = _candidate_text(candidate)
             if not current_text:
+                if chunk_finish_reason:
+                    break
                 continue
 
             if current_text.startswith(seen_text):
@@ -489,6 +493,8 @@ def stream_openai_completion(
                 seen_text += delta
 
             if not delta:
+                if chunk_finish_reason:
+                    break
                 continue
 
             yield _sse_data(
@@ -507,11 +513,17 @@ def stream_openai_completion(
                     ],
                 }
             )
+            if chunk_finish_reason:
+                break
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail=f"genai streaming failed: {exc}",
         ) from exc
+    finally:
+        close = getattr(stream, "close", None)
+        if callable(close):
+            close()
 
     yield _sse_data(
         {
@@ -630,20 +642,24 @@ def stream_openai_chat_completion(
 
     seen_text = ""
     finish_reason: str | None = None
+    stream = _generate_content_stream(
+        client=genai_client,
+        model=request.model,
+        prompt=prompt,
+        gen_config=gen_config,
+    )
     try:
-        for chunk in _generate_content_stream(
-            client=genai_client,
-            model=request.model,
-            prompt=prompt,
-            gen_config=gen_config,
-        ):
+        for chunk in stream:
             candidate = (getattr(chunk, "candidates", None) or [None])[0]
             if candidate is None:
                 continue
 
-            finish_reason = _normalize_finish_reason(getattr(candidate, "finish_reason", None)) or finish_reason
+            chunk_finish_reason = _normalize_finish_reason(getattr(candidate, "finish_reason", None))
+            finish_reason = chunk_finish_reason or finish_reason
             current_text = _candidate_text(candidate)
             if not current_text:
+                if chunk_finish_reason:
+                    break
                 continue
 
             if current_text.startswith(seen_text):
@@ -654,6 +670,8 @@ def stream_openai_chat_completion(
                 seen_text += delta
 
             if not delta:
+                if chunk_finish_reason:
+                    break
                 continue
 
             yield _sse_data(
@@ -665,11 +683,17 @@ def stream_openai_chat_completion(
                     "choices": [{"index": 0, "delta": {"content": delta}, "finish_reason": None}],
                 }
             )
+            if chunk_finish_reason:
+                break
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail=f"genai streaming failed: {exc}",
         ) from exc
+    finally:
+        close = getattr(stream, "close", None)
+        if callable(close):
+            close()
 
     yield _sse_data(
         {
