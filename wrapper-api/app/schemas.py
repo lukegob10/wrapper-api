@@ -12,6 +12,7 @@ class CompletionRequest(BaseModel):
 
     model: str = Field(..., description="Model identifier")
     prompt: Prompt = Field(..., description="Text prompt or list of prompts")
+    stream_options: Optional[dict[str, Any]] = None
     suffix: Optional[str] = None
     max_tokens: int = 16
     temperature: float = 1.0
@@ -62,6 +63,7 @@ class ChatCompletionRequest(BaseModel):
 
     model: str = Field(..., description="Model identifier")
     messages: List[ChatMessage]
+    stream_options: Optional[dict[str, Any]] = None
     max_tokens: Optional[int] = None
     max_completion_tokens: Optional[int] = None
     temperature: float = 1.0

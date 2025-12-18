@@ -44,6 +44,8 @@ curl -N http://localhost:8000/v1/chat/completions \
   -d '{"model":"gemini-1.5-flash","messages":[{"role":"user","content":"Stream a short haiku"}],"stream":true}'
 ```
 
+You should see a final `data: [DONE]` line and `curl` should exit. If Roo keeps “Request API” spinning, it usually means the client never received the terminating `[DONE]` chunk.
+
 ## Operational notes
 - Run behind an L7 proxy with keep-alives and rate limiting; scale Uvicorn workers ~1–2× vCPU.
 - Add observability (metrics/tracing) as needed.

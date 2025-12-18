@@ -3,6 +3,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 import os
+import queue
 import secrets
 import subprocess
 import threading
@@ -12,7 +13,7 @@ from typing import Any, Iterable, List, Sequence, Tuple
 from fastapi import HTTPException, status
 from google import genai
 from google.genai import types as genai_types
-from google.auth.credentials import Credentials as GoogleCredentials
+from google.auth.credentials import Credentials
 
 from .schemas import (
     ChatChoice,
@@ -51,6 +52,15 @@ SSL_CERT_ENV_KEYS: Sequence[str] = (
 
 # Roo/Cline often sends a dummy "API key" in the Authorization header. Ignore it by default.
 ALLOW_REQUEST_API_KEY = False
+
+# If your upstream/router streaming never terminates cleanly, set this to False
+# to "simulate" streaming via a single non-streaming call + SSE framing.
+USE_UPSTREAM_STREAMING = False
+
+# Safeties for upstream streaming: some routers never close the stream even after
+# the model is done. These timeouts prevent clients (e.g., Roo) from spinning forever.
+UPSTREAM_STREAM_START_TIMEOUT_SECONDS = 90.0
+UPSTREAM_STREAM_IDLE_TIMEOUT_SECONDS = 15.0
 
 
 def _run_command(command: str | Sequence[str]) -> str:
@@ -119,7 +129,7 @@ def _fetch_helix_token(command: str | Sequence[str]) -> tuple[str, dt.datetime |
     return token, expiry
 
 
-class HelixTokenCredentials(GoogleCredentials):
+class HelixTokenCredentials(Credentials):
     def __init__(self, command: str | Sequence[str]) -> None:
         super().__init__()
         self._command = command
@@ -376,6 +386,23 @@ def _sse_data(payload: dict[str, Any] | str) -> str:
     return f"data: {json.dumps(payload, ensure_ascii=False, separators=(',', ':'))}\n\n"
 
 
+def _request_include_usage(request: Any) -> bool:
+    stream_options = getattr(request, "stream_options", None)
+    if not isinstance(stream_options, dict):
+        return False
+    return bool(stream_options.get("include_usage"))
+
+
+def _usage_dict(usage: Usage | None) -> dict[str, int]:
+    if usage is None:
+        return {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+    return {
+        "prompt_tokens": usage.prompt_tokens or 0,
+        "completion_tokens": usage.completion_tokens or 0,
+        "total_tokens": usage.total_tokens or 0,
+    }
+
+
 def call_openai_completion(
     request: CompletionRequest,
     *,
@@ -460,6 +487,102 @@ def stream_openai_completion(
 
     completion_id = f"cmpl-{secrets.token_hex(12)}"
     created_at = int(time.time())
+    include_usage = _request_include_usage(request)
+
+    try:
+        if not USE_UPSTREAM_STREAMING:
+            response = _generate_content(
+                client=genai_client,
+                model=request.model,
+                prompt=request.prompt,
+                gen_config=gen_config,
+            )
+
+            choices, usage, _ = _extract_choices(response, start_index=0)
+            first = choices[0]
+            if first.text:
+                yield _sse_data(
+                    {
+                        "id": completion_id,
+                        "object": "text_completion",
+                        "created": created_at,
+                        "model": request.model,
+                        "choices": [
+                            {
+                                "text": first.text,
+                                "index": 0,
+                                "logprobs": None,
+                                "finish_reason": None,
+                            }
+                        ],
+                    }
+                )
+            final_payload: dict[str, Any] = {
+                "id": completion_id,
+                "object": "text_completion",
+                "created": created_at,
+                "model": request.model,
+                "choices": [
+                    {
+                        "text": "",
+                        "index": 0,
+                        "logprobs": None,
+                        "finish_reason": first.finish_reason or "stop",
+                    }
+                ],
+            }
+            if usage is not None:
+                final_payload["usage"] = usage.model_dump(exclude_none=True)
+            yield _sse_data(final_payload)
+            if include_usage:
+                yield _sse_data(
+                    {
+                        "id": completion_id,
+                        "object": "text_completion",
+                        "created": created_at,
+                        "model": request.model,
+                        "choices": [],
+                        "usage": _usage_dict(usage),
+                    }
+                )
+            yield _sse_data("[DONE]")
+            return
+    except Exception as exc:  # noqa: BLE001
+        error_text = f"Error: genai request failed: {exc}"
+        yield _sse_data(
+            {
+                "id": completion_id,
+                "object": "text_completion",
+                "created": created_at,
+                "model": request.model,
+                "choices": [
+                    {
+                        "text": error_text,
+                        "index": 0,
+                        "logprobs": None,
+                        "finish_reason": None,
+                    }
+                ],
+            }
+        )
+        yield _sse_data(
+            {
+                "id": completion_id,
+                "object": "text_completion",
+                "created": created_at,
+                "model": request.model,
+                "choices": [
+                    {
+                        "text": "",
+                        "index": 0,
+                        "logprobs": None,
+                        "finish_reason": "stop",
+                    }
+                ],
+            }
+        )
+        yield _sse_data("[DONE]")
+        return
 
     seen_text = ""
     finish_reason: str | None = None
@@ -470,8 +593,39 @@ def stream_openai_completion(
         prompt=request.prompt,
         gen_config=gen_config,
     )
-    try:
-        for chunk in stream:
+    stream_queue: queue.Queue[tuple[str, Any]] = queue.Queue()
+
+    def _producer() -> None:
+        try:
+            for item in stream:
+                stream_queue.put(("chunk", item))
+        except BaseException as exc:  # noqa: BLE001
+            stream_queue.put(("error", exc))
+        finally:
+            stream_queue.put(("done", None))
+
+    producer_thread = threading.Thread(target=_producer, daemon=True)
+    producer_thread.start()
+
+    stream_error: BaseException | None = None
+    got_any_chunk = False
+    while True:
+        timeout = (
+            UPSTREAM_STREAM_IDLE_TIMEOUT_SECONDS
+            if got_any_chunk
+            else UPSTREAM_STREAM_START_TIMEOUT_SECONDS
+        )
+        try:
+            kind, payload = stream_queue.get(timeout=timeout)
+        except queue.Empty:
+            if seen_text:
+                break
+            stream_error = TimeoutError(f"upstream stream idle for {timeout:.0f}s")
+            break
+
+        if kind == "chunk":
+            got_any_chunk = True
+            chunk = payload
             usage = _extract_usage(chunk) or usage
             candidate = (getattr(chunk, "candidates", None) or [None])[0]
             if candidate is None:
@@ -515,32 +669,66 @@ def stream_openai_completion(
             )
             if chunk_finish_reason:
                 break
-    except Exception as exc:  # noqa: BLE001
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=f"genai streaming failed: {exc}",
-        ) from exc
-    finally:
-        close = getattr(stream, "close", None)
-        if callable(close):
-            close()
+            continue
 
-    yield _sse_data(
-        {
-            "id": completion_id,
-            "object": "text_completion",
-            "created": created_at,
-            "model": request.model,
-            "choices": [
-                {
-                    "text": "",
-                    "index": 0,
-                    "logprobs": None,
-                    "finish_reason": finish_reason or "stop",
-                }
-            ],
-        }
-    )
+        if kind == "error":
+            stream_error = payload if isinstance(payload, BaseException) else RuntimeError(str(payload))
+            break
+
+        if kind == "done":
+            break
+
+    close = getattr(stream, "close", None)
+    if callable(close):
+        close()
+
+    if stream_error is not None and not seen_text:
+        error_text = f"Error: genai streaming failed: {stream_error}"
+        yield _sse_data(
+            {
+                "id": completion_id,
+                "object": "text_completion",
+                "created": created_at,
+                "model": request.model,
+                "choices": [
+                    {
+                        "text": error_text,
+                        "index": 0,
+                        "logprobs": None,
+                        "finish_reason": None,
+                    }
+                ],
+            }
+        )
+
+    final_payload = {
+        "id": completion_id,
+        "object": "text_completion",
+        "created": created_at,
+        "model": request.model,
+        "choices": [
+            {
+                "text": "",
+                "index": 0,
+                "logprobs": None,
+                "finish_reason": finish_reason or "stop",
+            }
+        ],
+    }
+    if usage is not None:
+        final_payload["usage"] = usage.model_dump(exclude_none=True)
+    yield _sse_data(final_payload)
+    if include_usage:
+        yield _sse_data(
+            {
+                "id": completion_id,
+                "object": "text_completion",
+                "created": created_at,
+                "model": request.model,
+                "choices": [],
+                "usage": _usage_dict(usage),
+            }
+        )
     yield _sse_data("[DONE]")
 
 
@@ -629,6 +817,7 @@ def stream_openai_chat_completion(
 
     completion_id = f"chatcmpl-{secrets.token_hex(12)}"
     created_at = int(time.time())
+    include_usage = _request_include_usage(request)
 
     yield _sse_data(
         {
@@ -636,20 +825,126 @@ def stream_openai_chat_completion(
             "object": "chat.completion.chunk",
             "created": created_at,
             "model": request.model,
-            "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
+            "choices": [{"index": 0, "delta": {"role": "assistant", "content": ""}, "finish_reason": None}],
         }
     )
 
+    try:
+        if not USE_UPSTREAM_STREAMING:
+            response = _generate_content(
+                client=genai_client,
+                model=request.model,
+                prompt=prompt,
+                gen_config=gen_config,
+            )
+
+            candidate = (getattr(response, "candidates", None) or [None])[0]
+            if candidate is None:
+                raise RuntimeError("genai response contained no candidates")
+
+            text = _candidate_text(candidate)
+            finish_reason = _normalize_finish_reason(getattr(candidate, "finish_reason", None)) or "stop"
+            usage = _extract_usage(response)
+            if text:
+                yield _sse_data(
+                    {
+                        "id": completion_id,
+                        "object": "chat.completion.chunk",
+                        "created": created_at,
+                        "model": request.model,
+                        "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": None}],
+                    }
+                )
+
+            final_payload: dict[str, Any] = {
+                "id": completion_id,
+                "object": "chat.completion.chunk",
+                "created": created_at,
+                "model": request.model,
+                "choices": [{"index": 0, "delta": {"content": ""}, "finish_reason": finish_reason}],
+            }
+            if usage is not None:
+                final_payload["usage"] = usage.model_dump(exclude_none=True)
+            yield _sse_data(final_payload)
+            if include_usage:
+                yield _sse_data(
+                    {
+                        "id": completion_id,
+                        "object": "chat.completion.chunk",
+                        "created": created_at,
+                        "model": request.model,
+                        "choices": [],
+                        "usage": _usage_dict(usage),
+                    }
+                )
+            yield _sse_data("[DONE]")
+            return
+    except Exception as exc:  # noqa: BLE001
+        error_text = f"Error: genai request failed: {exc}"
+        yield _sse_data(
+            {
+                "id": completion_id,
+                "object": "chat.completion.chunk",
+                "created": created_at,
+                "model": request.model,
+                "choices": [{"index": 0, "delta": {"content": error_text}, "finish_reason": None}],
+            }
+        )
+        yield _sse_data(
+            {
+                "id": completion_id,
+                "object": "chat.completion.chunk",
+                "created": created_at,
+                "model": request.model,
+                "choices": [{"index": 0, "delta": {"content": ""}, "finish_reason": "stop"}],
+            }
+        )
+        yield _sse_data("[DONE]")
+        return
+
     seen_text = ""
     finish_reason: str | None = None
+    usage: Usage | None = None
     stream = _generate_content_stream(
         client=genai_client,
         model=request.model,
         prompt=prompt,
         gen_config=gen_config,
     )
-    try:
-        for chunk in stream:
+    stream_queue: queue.Queue[tuple[str, Any]] = queue.Queue()
+
+    def _producer() -> None:
+        try:
+            for item in stream:
+                stream_queue.put(("chunk", item))
+        except BaseException as exc:  # noqa: BLE001
+            stream_queue.put(("error", exc))
+        finally:
+            stream_queue.put(("done", None))
+
+    producer_thread = threading.Thread(target=_producer, daemon=True)
+    producer_thread.start()
+
+    stream_error: BaseException | None = None
+    got_any_chunk = False
+    while True:
+        timeout = (
+            UPSTREAM_STREAM_IDLE_TIMEOUT_SECONDS
+            if got_any_chunk
+            else UPSTREAM_STREAM_START_TIMEOUT_SECONDS
+        )
+        try:
+            kind, payload = stream_queue.get(timeout=timeout)
+        except queue.Empty:
+            if seen_text:
+                break
+            stream_error = TimeoutError(f"upstream stream idle for {timeout:.0f}s")
+            break
+
+        if kind == "chunk":
+            got_any_chunk = True
+            chunk = payload
+            usage = _extract_usage(chunk) or usage
             candidate = (getattr(chunk, "candidates", None) or [None])[0]
             if candidate is None:
                 continue
@@ -685,23 +980,50 @@ def stream_openai_chat_completion(
             )
             if chunk_finish_reason:
                 break
-    except Exception as exc:  # noqa: BLE001
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=f"genai streaming failed: {exc}",
-        ) from exc
-    finally:
-        close = getattr(stream, "close", None)
-        if callable(close):
-            close()
+            continue
 
-    yield _sse_data(
-        {
-            "id": completion_id,
-            "object": "chat.completion.chunk",
-            "created": created_at,
-            "model": request.model,
-            "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason or "stop"}],
-        }
-    )
+        if kind == "error":
+            stream_error = payload if isinstance(payload, BaseException) else RuntimeError(str(payload))
+            break
+
+        if kind == "done":
+            break
+
+    close = getattr(stream, "close", None)
+    if callable(close):
+        close()
+
+    if stream_error is not None and not seen_text:
+        error_text = f"Error: genai streaming failed: {stream_error}"
+        yield _sse_data(
+            {
+                "id": completion_id,
+                "object": "chat.completion.chunk",
+                "created": created_at,
+                "model": request.model,
+                "choices": [{"index": 0, "delta": {"content": error_text}, "finish_reason": None}],
+            }
+        )
+
+    final_payload = {
+        "id": completion_id,
+        "object": "chat.completion.chunk",
+        "created": created_at,
+        "model": request.model,
+        "choices": [{"index": 0, "delta": {"content": ""}, "finish_reason": finish_reason or "stop"}],
+    }
+    if usage is not None:
+        final_payload["usage"] = usage.model_dump(exclude_none=True)
+    yield _sse_data(final_payload)
+    if include_usage:
+        yield _sse_data(
+            {
+                "id": completion_id,
+                "object": "chat.completion.chunk",
+                "created": created_at,
+                "model": request.model,
+                "choices": [],
+                "usage": _usage_dict(usage),
+            }
+        )
     yield _sse_data("[DONE]")

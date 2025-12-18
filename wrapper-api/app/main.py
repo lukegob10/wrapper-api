@@ -83,8 +83,8 @@ async def create_completion(
             stream_openai_completion(payload, api_key=api_key),
             media_type="text/event-stream",
             headers={
-                "Cache-Control": "no-cache",
-                "Connection": "keep-alive",
+                "Cache-Control": "no-cache, no-transform",
+                "Connection": "close",
                 "X-Accel-Buffering": "no",
             },
         )
@@ -109,8 +109,8 @@ async def create_chat_completion(
             stream_openai_chat_completion(payload, api_key=api_key),
             media_type="text/event-stream",
             headers={
-                "Cache-Control": "no-cache",
-                "Connection": "keep-alive",
+                "Cache-Control": "no-cache, no-transform",
+                "Connection": "close",
                 "X-Accel-Buffering": "no",
             },
         )
