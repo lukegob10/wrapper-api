@@ -1,3 +1,4 @@
+import math
 import json
 import os
 import re
@@ -49,14 +50,54 @@ def _load_dotenv(path: str = ".env") -> None:
 
 
 _load_dotenv()
-DEFAULT_MODEL = os.getenv("GENAI_MODEL", "gemini-2.0-flash")
+# Keep a default only for `/v1/models` advertising and manual curl tests.
+# Chat completions should use the request's `model`.
+DEFAULT_MODEL = "gemini-2.0-flash"
 HOST = os.getenv("HOST", "127.0.0.1")
 PORT = int(os.getenv("PORT", "8000"))
 LOG_REQUESTS = (os.getenv("LOG_REQUESTS") or "").strip().lower() in {"1", "true", "yes", "y", "on"}
 
+OPENAI_RATELIMIT_LIMIT_REQUESTS = int(os.getenv("OPENAI_RATELIMIT_LIMIT_REQUESTS", "9999"))
+OPENAI_RATELIMIT_LIMIT_TOKENS = int(os.getenv("OPENAI_RATELIMIT_LIMIT_TOKENS", "999999"))
+OPENAI_RATELIMIT_RESET_SECONDS = int(os.getenv("OPENAI_RATELIMIT_RESET_SECONDS", "1"))
+
 app = FastAPI(title=APP_TITLE, version="0.1.0")
 
 _client: Any | None = None
+
+
+def _openai_rate_limit_headers(*, status_code: int, retry_after_seconds: int | None = None) -> dict[str, str]:
+    reset_seconds = retry_after_seconds if isinstance(retry_after_seconds, int) and retry_after_seconds > 0 else OPENAI_RATELIMIT_RESET_SECONDS
+    remaining_requests = 0 if status_code == 429 else OPENAI_RATELIMIT_LIMIT_REQUESTS
+    remaining_tokens = 0 if status_code == 429 else OPENAI_RATELIMIT_LIMIT_TOKENS
+    reset_str = f"{reset_seconds}s"
+    return {
+        "x-ratelimit-limit-requests": str(OPENAI_RATELIMIT_LIMIT_REQUESTS),
+        "x-ratelimit-remaining-requests": str(max(0, remaining_requests)),
+        "x-ratelimit-reset-requests": reset_str,
+        "x-ratelimit-limit-tokens": str(OPENAI_RATELIMIT_LIMIT_TOKENS),
+        "x-ratelimit-remaining-tokens": str(max(0, remaining_tokens)),
+        "x-ratelimit-reset-tokens": reset_str,
+    }
+
+
+@app.middleware("http")
+async def _add_openai_ratelimit_headers(request: Request, call_next):  # type: ignore[no-untyped-def]
+    response = await call_next(request)
+
+    retry_after_seconds: int | None = None
+    if response.status_code == 429:
+        ra = response.headers.get("Retry-After")
+        if ra:
+            try:
+                retry_after_seconds = int(math.ceil(float(ra)))
+            except Exception:
+                retry_after_seconds = None
+
+    for k, v in _openai_rate_limit_headers(status_code=response.status_code, retry_after_seconds=retry_after_seconds).items():
+        if k not in response.headers:
+            response.headers[k] = v
+    return response
 
 
 def _get_auth_token(authorization: str | None, x_api_key: str | None) -> str | None:
@@ -731,9 +772,16 @@ def _sse(data: Any) -> str:
     return f"data: {json.dumps(data, separators=(',', ':'))}\n\n"
 
 
-def _openai_error(status_code: int, message: str, *, error_type: str = "api_error") -> JSONResponse:
+def _openai_error(
+    status_code: int,
+    message: str,
+    *,
+    error_type: str = "api_error",
+    headers: dict[str, str] | None = None,
+) -> JSONResponse:
     return JSONResponse(
         status_code=status_code,
+        headers=headers,
         content={
             "error": {
                 "message": message,
@@ -745,6 +793,29 @@ def _openai_error(status_code: int, message: str, *, error_type: str = "api_erro
     )
 
 
+def _parse_retry_after_seconds(message: str) -> int | None:
+    if not message:
+        return None
+
+    # Google errors often contain RetryInfo: 'retryDelay': '11s'
+    m = re.search(r"retryDelay[\"']\s*:\s*[\"'](\d+)s[\"']", message)
+    if m:
+        try:
+            return int(m.group(1))
+        except Exception:
+            return None
+
+    # Or: "Please retry in 11.47287309s."
+    m = re.search(r"retry in\s+(\d+(?:\.\d+)?)s", message, flags=re.IGNORECASE)
+    if m:
+        try:
+            return max(1, int(math.ceil(float(m.group(1)))))
+        except Exception:
+            return None
+
+    return None
+
+
 def _maybe_handle_genai_error(exc: Exception) -> JSONResponse | None:
     if genai_errors is None:
         return None
@@ -753,9 +824,20 @@ def _maybe_handle_genai_error(exc: Exception) -> JSONResponse | None:
         status_code = getattr(exc, "status_code", None)
         if not isinstance(status_code, int):
             status_code = 400
+        headers: dict[str, str] | None = None
+        if status_code == 429:
+            retry_after = _parse_retry_after_seconds(str(exc))
+            if retry_after is None:
+                retry_after = OPENAI_RATELIMIT_RESET_SECONDS
+            headers = {"Retry-After": str(retry_after)}
         if LOG_REQUESTS:
             print(f"GenAI ClientError {status_code}: {exc}")
-        return _openai_error(status_code, str(exc), error_type="rate_limit_error" if status_code == 429 else "api_error")
+        return _openai_error(
+            status_code,
+            str(exc),
+            error_type="rate_limit_error" if status_code == 429 else "api_error",
+            headers=headers,
+        )
 
     if isinstance(exc, getattr(genai_errors, "ServerError", ())):
         status_code = getattr(exc, "status_code", None)
@@ -815,7 +897,11 @@ async def chat_completions(
         else:
             print("REQUEST messages not list:", type(messages_preview).__name__)
 
-    model = body.get("model") or DEFAULT_MODEL
+    model = body.get("model")
+    if not isinstance(model, str) or not model.strip():
+        raise HTTPException(status_code=400, detail="model must be a non-empty string.")
+    model = model.strip()
+    print(model)
     messages = body.get("messages")
     if not isinstance(messages, list):
         raise HTTPException(status_code=400, detail="messages must be an array.")
@@ -898,6 +984,7 @@ async def chat_completions(
         # and stream back a minimal chunk sequence.
         if tools:
             try:
+                print(model)
                 response = await run_in_threadpool(
                     lambda: client.models.generate_content(model=model, contents=contents, config=config)
                 )
