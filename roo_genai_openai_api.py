@@ -1,9 +1,11 @@
-import math
 import json
+import math
 import os
 import re
+import subprocess
 import time
 import uuid
+from dataclasses import dataclass
 from collections.abc import AsyncIterator, Iterable
 from typing import Any
 
@@ -20,6 +22,16 @@ except Exception:  # pragma: no cover
     genai = None
     types = None
     genai_errors = None
+
+try:
+    import google.auth  # type: ignore
+except Exception:  # pragma: no cover
+    google = None  # type: ignore
+
+try:
+    from anthropic import AnthropicVertex  # type: ignore
+except Exception:  # pragma: no cover
+    AnthropicVertex = None  # type: ignore
 
 
 APP_TITLE = "GenAI OpenAI-Compatible API"
@@ -53,6 +65,11 @@ _load_dotenv()
 # Keep a default only for `/v1/models` advertising and manual curl tests.
 # Chat completions should use the request's `model`.
 DEFAULT_MODEL = "gemini-2.0-flash"
+DEFAULT_VERTEX_REGION = (
+    os.getenv("VERTEX_REGION")
+    or os.getenv("DEFAULT_VERTEX_REGION")
+    or "us-central1"
+)
 HOST = os.getenv("HOST", "127.0.0.1")
 PORT = int(os.getenv("PORT", "8000"))
 LOG_REQUESTS = (os.getenv("LOG_REQUESTS") or "").strip().lower() in {"1", "true", "yes", "y", "on"}
@@ -61,9 +78,25 @@ OPENAI_RATELIMIT_LIMIT_REQUESTS = int(os.getenv("OPENAI_RATELIMIT_LIMIT_REQUESTS
 OPENAI_RATELIMIT_LIMIT_TOKENS = int(os.getenv("OPENAI_RATELIMIT_LIMIT_TOKENS", "999999"))
 OPENAI_RATELIMIT_RESET_SECONDS = int(os.getenv("OPENAI_RATELIMIT_RESET_SECONDS", "1"))
 
+HELIX_TOKEN_COMMAND = os.getenv("HELIX_TOKEN_COMMAND")
+HELIX_TOKEN_TIMEOUT_SECONDS = int(os.getenv("HELIX_TOKEN_TIMEOUT_SECONDS", "15"))
+HELIX_TOKEN_TTL_SECONDS = int(os.getenv("HELIX_TOKEN_TTL_SECONDS", "3300"))
+HELIX_CERT_FILE = os.getenv("HELIX_CERT_FILE") or os.getenv("HELIX_SSL_CERT_FILE") or os.getenv("HELIX_PEM_FILE")
+
 app = FastAPI(title=APP_TITLE, version="0.1.0")
 
-_client: Any | None = None
+_client_cache: dict[str | None, Any] = {}
+_anthropic_client_cache: dict[tuple[str, str, str | None], Any] = {}
+_helix_token_cache: dict[str, Any] = {"token": None, "expires_at": 0.0}
+_client_meta: dict[str, Any] = {}  # tracks api_key for cached genai client
+
+
+@dataclass
+class ModelTarget:
+    provider: str  # "gemini" or "claude"
+    model: str
+    location: str | None = None
+    region: str | None = None
 
 
 def _openai_rate_limit_headers(*, status_code: int, retry_after_seconds: int | None = None) -> dict[str, str]:
@@ -127,17 +160,152 @@ def _google_api_key() -> str:
     return key
 
 
-def _get_client() -> Any:
-    global _client
-    if _client is not None:
-        return _client
+def _apply_helix_cert_env() -> None:
+    if not HELIX_CERT_FILE:
+        return
+    for key in ("SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE"):
+        os.environ.setdefault(key, HELIX_CERT_FILE)
+
+
+def _fetch_helix_token() -> tuple[str, float]:
+    if not HELIX_TOKEN_COMMAND:
+        raise RuntimeError("HELIX_TOKEN_COMMAND is not set")
+    _apply_helix_cert_env()
+    try:
+        output = subprocess.check_output(
+            HELIX_TOKEN_COMMAND,
+            shell=True,
+            stderr=subprocess.STDOUT,
+            timeout=HELIX_TOKEN_TIMEOUT_SECONDS,
+            text=True,
+        ).strip()
+    except subprocess.CalledProcessError as exc:
+        message = (exc.output or "").strip()
+        raise RuntimeError(f"helix token command failed (exit {exc.returncode}): {message}") from exc
+    except Exception as exc:
+        raise RuntimeError(f"helix token command failed: {exc}") from exc
+
+    token = ""
+    expires_in: float | None = None
+    try:
+        data = json.loads(output)
+        if isinstance(data, dict):
+            token = str(data.get("access_token") or data.get("token") or "").strip()
+            expires_in = data.get("expires_in")
+    except Exception:
+        pass
+
+    if not token:
+        token = output.splitlines()[0].strip()
+    if token.lower().startswith("bearer "):
+        token = token[7:].strip()
+    if not token:
+        raise RuntimeError("helix token command returned no token")
+
+    ttl = float(expires_in) if isinstance(expires_in, (int, float)) else float(HELIX_TOKEN_TTL_SECONDS)
+    # Refresh a bit early to avoid expiry mid-call.
+    expires_at = time.time() + max(30.0, ttl - 30.0)
+    return token, expires_at
+
+
+def _helix_api_key() -> str | None:
+    if not HELIX_TOKEN_COMMAND:
+        return None
+    now = time.time()
+    token = _helix_token_cache.get("token")
+    expires_at = _helix_token_cache.get("expires_at", 0.0) or 0.0
+    if token and now < expires_at:
+        return token
+    token, expires_at = _fetch_helix_token()
+    _helix_token_cache["token"] = token
+    _helix_token_cache["expires_at"] = expires_at
+    return token
+
+
+def _current_genai_api_key() -> str:
+    try:
+        token = _helix_api_key()
+    except Exception:
+        token = None
+        try:
+            token, expires_at = _fetch_helix_token()
+            _helix_token_cache["token"] = token
+            _helix_token_cache["expires_at"] = expires_at
+        except Exception:
+            token = None
+    return token or _google_api_key()
+
+
+def _vertex_project_id() -> str:
+    project = os.getenv("VERTEX_PROJECT") or os.getenv("GOOGLE_CLOUD_PROJECT") or os.getenv("GOOGLE_PROJECT")
+    if not project:
+        raise HTTPException(
+            status_code=500,
+            detail="Missing Vertex project id (set VERTEX_PROJECT or GOOGLE_CLOUD_PROJECT).",
+        )
+    return project
+
+
+def _get_client(location: str | None = None) -> Any:
+    api_key = _current_genai_api_key()
+    cached = _client_cache.get("client")
+    cached_key = _client_meta.get("api_key")
+    if cached is not None and cached_key == api_key:
+        return cached
     if genai is None:
         raise HTTPException(
             status_code=500,
             detail="google-genai is not installed. Install with: pip install google-genai",
         )
-    _client = genai.Client(api_key=_google_api_key())
-    return _client
+    client = genai.Client(api_key=api_key)
+    _client_cache["client"] = client
+    _client_meta["api_key"] = api_key
+    return client
+
+
+def _get_anthropic_client(region: str) -> Any:
+    # Prefer Helix token (api_key) if available; otherwise use ADC credentials.
+    api_key = None
+    try:
+        api_key = _helix_api_key()
+    except Exception:
+        try:
+            token, expires_at = _fetch_helix_token()
+            _helix_token_cache["token"] = token
+            _helix_token_cache["expires_at"] = expires_at
+            api_key = token
+        except Exception:
+            api_key = None
+
+    cache_key = (_vertex_project_id(), region, api_key)
+    cached = _anthropic_client_cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    if AnthropicVertex is None:
+        raise HTTPException(
+            status_code=500,
+            detail="anthropic>=0.37.0 is required for Vertex Claude. Install with: pip install anthropic",
+        )
+
+    client_kwargs: dict[str, Any] = {
+        "region": region,
+        "project_id": _vertex_project_id(),
+    }
+    if api_key:
+        client_kwargs["api_key"] = api_key
+    else:
+        if google is None:
+            raise HTTPException(status_code=500, detail="google-auth is required for Vertex Claude.")
+        try:
+            credentials, _ = google.auth.default()  # type: ignore[attr-defined]
+            client_kwargs["credentials"] = credentials
+        except Exception as exc:  # pragma: no cover
+            raise HTTPException(status_code=500, detail=f"Unable to load Google credentials: {exc}") from exc
+
+    client = AnthropicVertex(**client_kwargs)
+    _anthropic_client_cache[cache_key] = client
+    return client
 
 
 def _estimate_tokens(text: str) -> int:
@@ -172,6 +340,24 @@ def _message_text(message: dict[str, Any]) -> str:
             )
         return "".join(parts)
     raise HTTPException(status_code=400, detail="Invalid message.content")
+
+
+def _messages_to_anthropic(messages: list[dict[str, Any]]) -> tuple[str | None, list[dict[str, Any]]]:
+    system_parts: list[str] = []
+    convo: list[dict[str, Any]] = []
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        role = msg.get("role")
+        text = _message_text(msg)
+        if role == "system":
+            if text:
+                system_parts.append(text)
+            continue
+        if role in {"user", "assistant"}:
+            convo.append({"role": role, "content": text})
+    system_prompt = "\n".join(system_parts) if system_parts else None
+    return system_prompt, convo
 
 
 def _part_text(text: str) -> Any:
@@ -816,6 +1002,27 @@ def _parse_retry_after_seconds(message: str) -> int | None:
     return None
 
 
+def _is_claude_model(model: str) -> bool:
+    m = model.lower()
+    return m.startswith("claude")
+
+
+def _is_gemini_model(model: str) -> bool:
+    m = model.lower()
+    return m.startswith("gemini") or "gemini" in m
+
+
+def _resolve_model_target(model: str) -> ModelTarget:
+    if _is_claude_model(model):
+        region = DEFAULT_VERTEX_REGION
+        if not region:
+            raise HTTPException(status_code=400, detail="Missing Vertex region for Claude models.")
+        return ModelTarget(provider="claude", model=model, region=region)
+    if _is_gemini_model(model):
+        return ModelTarget(provider="gemini", model=model, location=None)
+    raise HTTPException(status_code=400, detail=f"Unsupported model '{model}'.")
+
+
 def _maybe_handle_genai_error(exc: Exception) -> JSONResponse | None:
     if genai_errors is None:
         return None
@@ -942,6 +1149,79 @@ async def chat_completions(
     created = int(time.time())
     completion_id = f"chatcmpl-{uuid.uuid4().hex}"
 
+    target = _resolve_model_target(model)
+    model = target.model
+
+    if target.provider == "claude":
+        if stream:
+            raise HTTPException(status_code=400, detail="stream is not supported for Claude on Vertex yet.")
+        system_prompt, claude_messages = _messages_to_anthropic(messages)
+        try:
+            claude_client = _get_anthropic_client(region=target.region or DEFAULT_VERTEX_REGION)
+            claude_response = await run_in_threadpool(
+                lambda: claude_client.messages.create(
+                    model=target.model,
+                    messages=claude_messages,
+                    system=system_prompt,
+                    max_tokens=max_tokens or 256,
+                    temperature=temperature,
+                    top_p=top_p,
+                    stop_sequences=stop_sequences,
+                )
+            )
+        except HTTPException:
+            raise
+        except Exception as exc_first:  # pragma: no cover
+            # Retry once with a fresh client in case creds/token expired.
+            try:
+                _anthropic_client_cache.clear()
+                claude_client = _get_anthropic_client(region=target.region or DEFAULT_VERTEX_REGION)
+                claude_response = await run_in_threadpool(
+                    lambda: claude_client.messages.create(
+                        model=target.model,
+                        messages=claude_messages,
+                        system=system_prompt,
+                        max_tokens=max_tokens or 256,
+                        temperature=temperature,
+                        top_p=top_p,
+                        stop_sequences=stop_sequences,
+                    )
+                )
+            except Exception as exc_second:
+                raise HTTPException(status_code=500, detail=str(exc_second)) from exc_first
+
+        text_parts: list[str] = []
+        for part in getattr(claude_response, "content", []) or []:
+            if getattr(part, "type", None) == "text":
+                text_parts.append(getattr(part, "text", "") or "")
+        text = "".join(text_parts)
+        if not text:
+            text = "[empty response]"
+
+        prompt_text = "\n".join(_message_text(m) for m in messages if isinstance(m, dict))
+        usage = {
+            "prompt_tokens": _estimate_tokens(prompt_text),
+            "completion_tokens": _estimate_tokens(text),
+            "total_tokens": _estimate_tokens(prompt_text) + _estimate_tokens(text),
+        }
+
+        return JSONResponse(
+            {
+                "id": completion_id,
+                "object": "chat.completion",
+                "created": created,
+                "model": target.model,
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": text},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": usage,
+            }
+        )
+
     openai_tools_raw = _normalize_openai_tools(body)
     if LOG_REQUESTS:
         print("REQUEST tools present:", bool(openai_tools_raw), "count:", len(openai_tools_raw or []))
@@ -976,7 +1256,7 @@ async def chat_completions(
         tool_config=tool_config,
     )
 
-    client = _get_client()
+    client = _get_client(location=target.location)
 
     if stream:
         # Streaming tool calls in OpenAI format requires incremental tool_call deltas.
@@ -989,10 +1269,26 @@ async def chat_completions(
                     lambda: client.models.generate_content(model=model, contents=contents, config=config)
                 )
             except Exception as exc:
+                _client_cache.pop("client", None)
+                _client_meta.pop("api_key", None)
+                client = _get_client(location=target.location)
+                try:
+                    response = await run_in_threadpool(
+                        lambda: client.models.generate_content(model=model, contents=contents, config=config)
+                    )
+                except Exception as exc2:
+                    err = _maybe_handle_genai_error(exc2)
+                    if err is not None:
+                        return err
+                    raise
+            else:
+                pass
+            try:
                 err = _maybe_handle_genai_error(exc)
                 if err is not None:
                     return err
-                raise
+            except UnboundLocalError:
+                pass
 
             text = _extract_text(response)
             tool_calls = _extract_function_calls(response, genai_to_openai=genai_to_openai)
@@ -1070,12 +1366,44 @@ async def chat_completions(
                             }
                         )
                 except Exception as exc:  # pragma: no cover
-                    err = _maybe_handle_genai_error(exc)
-                    if err is None:
-                        raise
-                    yield _sse({"error": err.body.decode("utf-8") if hasattr(err, "body") else str(exc)})
-                    yield "data: [DONE]\n\n"
-                    return
+                    _client_cache.pop("client", None)
+                    _client_meta.pop("api_key", None)
+                    client_retry = _get_client(location=target.location)
+                    stream_fn_retry = getattr(getattr(client_retry, "models", None), "generate_content_stream", None)
+                    if callable(stream_fn_retry):
+                        try:
+                            stream_iter_retry: Iterable[Any] = stream_fn_retry(model=model, contents=contents, config=config)
+                            async for chunk in iterate_in_threadpool(stream_iter_retry):
+                                chunk_text = _extract_text(chunk)
+                                if not chunk_text:
+                                    continue
+                                delta = chunk_text[len(sent) :] if chunk_text.startswith(sent) else chunk_text
+                                sent = chunk_text if chunk_text.startswith(sent) else (sent + delta)
+                                if not delta:
+                                    continue
+                                yield _sse(
+                                    {
+                                        "id": completion_id,
+                                        "object": "chat.completion.chunk",
+                                        "created": created,
+                                        "model": model,
+                                        "choices": [{"index": 0, "delta": {"content": delta}, "finish_reason": None}],
+                                    }
+                                )
+                        except Exception as exc_retry:  # pragma: no cover
+                            err = _maybe_handle_genai_error(exc_retry)
+                            if err is None:
+                                raise
+                            yield _sse({"error": err.body.decode("utf-8") if hasattr(err, "body") else str(exc_retry)})
+                            yield "data: [DONE]\n\n"
+                            return
+                    else:
+                        err = _maybe_handle_genai_error(exc)
+                        if err is None:
+                            raise
+                        yield _sse({"error": err.body.decode("utf-8") if hasattr(err, "body") else str(exc)})
+                        yield "data: [DONE]\n\n"
+                        return
             else:
                 try:
                     response = await run_in_threadpool(
@@ -1083,12 +1411,21 @@ async def chat_completions(
                     )
                     full_text = _extract_text(response)
                 except Exception as exc:  # pragma: no cover
-                    err = _maybe_handle_genai_error(exc)
-                    if err is None:
-                        raise
-                    yield _sse({"error": err.body.decode("utf-8") if hasattr(err, "body") else str(exc)})
-                    yield "data: [DONE]\n\n"
-                    return
+                    _client_cache.pop("client", None)
+                    _client_meta.pop("api_key", None)
+                    client = _get_client(location=target.location)
+                    try:
+                        response = await run_in_threadpool(
+                            lambda: client.models.generate_content(model=model, contents=contents, config=config)
+                        )
+                        full_text = _extract_text(response)
+                    except Exception as exc_retry:  # pragma: no cover
+                        err = _maybe_handle_genai_error(exc_retry)
+                        if err is None:
+                            raise
+                        yield _sse({"error": err.body.decode("utf-8") if hasattr(err, "body") else str(exc_retry)})
+                        yield "data: [DONE]\n\n"
+                        return
                 chunk_size = 80
                 for i in range(0, len(full_text), chunk_size):
                     delta = full_text[i : i + chunk_size]
@@ -1120,10 +1457,18 @@ async def chat_completions(
             lambda: client.models.generate_content(model=model, contents=contents, config=config)
         )
     except Exception as exc:
-        err = _maybe_handle_genai_error(exc)
-        if err is not None:
-            return err
-        raise
+        _client_cache.pop("client", None)
+        _client_meta.pop("api_key", None)
+        client = _get_client(location=target.location)
+        try:
+            response = await run_in_threadpool(
+                lambda: client.models.generate_content(model=model, contents=contents, config=config)
+            )
+        except Exception as exc_retry:
+            err = _maybe_handle_genai_error(exc_retry)
+            if err is not None:
+                return err
+            raise
     text = _extract_text(response)
     tool_calls = _extract_function_calls(response, genai_to_openai=genai_to_openai)
     parallel_tool_calls = body.get("parallel_tool_calls")
