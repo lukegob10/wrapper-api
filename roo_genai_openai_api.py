@@ -1,11 +1,35 @@
-import json
+# CHANGES IN THIS ITERATION (high-level)
+# 1) Added dual-mode client initialization:
+#    - PERSONAL mode: uses GOOGLE_API_KEY / GEMINI_API_KEY (as before)
+#    - WORK mode: uses Helix CLI token + optional endpoint/project/location/vertex settings
+# 2) Client construction is now "signature-safe": we only pass kwargs supported by your installed google-genai version.
+# 3) Token refresh/re-init is built-in: if auth/token expires, cached client is reset and the call is retried once.
+#
+# WHAT YOU NEED TO SET (env vars)
+# - GENAI_AUTH_MODE = "personal" (default) OR "work"
+#
+# PERSONAL MODE:
+# - GOOGLE_API_KEY or GEMINI_API_KEY
+#
+# WORK MODE (examples; set what you actually have):
+# - HELIX_TOKEN_COMMAND="helix token"   (whatever prints a token to stdout)
+# - GENAI_API_ENDPOINT="https://your.internal.endpoint"   (optional)
+# - GENAI_VERTEXAI="1"                  (optional; if using Vertex AI auth mode)
+# - GENAI_PROJECT="your-gcp-project"    (optional; for vertexai=True)
+# - GENAI_LOCATION="us-central1"        (optional; for vertexai=True)
+#
+# Note: This file stays compatible even if your google-genai Client signature differs across environments.
+
 import math
+import json
 import os
 import re
-import subprocess
 import time
 import uuid
-from dataclasses import dataclass
+import asyncio
+import subprocess
+import shlex
+import inspect
 from collections.abc import AsyncIterator, Iterable
 from typing import Any
 
@@ -23,16 +47,6 @@ except Exception:  # pragma: no cover
     types = None
     genai_errors = None
 
-try:
-    import google.auth  # type: ignore
-except Exception:  # pragma: no cover
-    google = None  # type: ignore
-
-try:
-    from anthropic import AnthropicVertex  # type: ignore
-except Exception:  # pragma: no cover
-    AnthropicVertex = None  # type: ignore
-
 
 APP_TITLE = "GenAI OpenAI-Compatible API"
 
@@ -41,8 +55,11 @@ def _load_dotenv(path: str = ".env") -> None:
     """
     Minimal .env loader (no dependencies).
     - Supports KEY=VALUE lines and optional quotes.
-    - Does not override existing environment variables.
+    - By default does NOT override existing environment variables.
+    - Set DOTENV_OVERRIDE=1 to override existing env vars.
     """
+    override = (os.getenv("DOTENV_OVERRIDE") or "").strip().lower() in {"1", "true", "yes", "y", "on"}
+
     try:
         with open(path, "r", encoding="utf-8") as f:
             for raw in f:
@@ -52,10 +69,15 @@ def _load_dotenv(path: str = ".env") -> None:
                 key, value = line.split("=", 1)
                 key = key.strip()
                 value = value.strip()
-                if not key or key in os.environ:
+                if not key:
                     continue
                 if (value.startswith('"') and value.endswith('"')) or (value.startswith("'") and value.endswith("'")):
                     value = value[1:-1]
+                # strip accidental whitespace
+                value = value.strip()
+
+                if not override and key in os.environ:
+                    continue
                 os.environ[key] = value
     except FileNotFoundError:
         return
@@ -65,11 +87,6 @@ _load_dotenv()
 # Keep a default only for `/v1/models` advertising and manual curl tests.
 # Chat completions should use the request's `model`.
 DEFAULT_MODEL = "gemini-2.0-flash"
-DEFAULT_VERTEX_REGION = (
-    os.getenv("VERTEX_REGION")
-    or os.getenv("DEFAULT_VERTEX_REGION")
-    or "us-central1"
-)
 HOST = os.getenv("HOST", "127.0.0.1")
 PORT = int(os.getenv("PORT", "8000"))
 LOG_REQUESTS = (os.getenv("LOG_REQUESTS") or "").strip().lower() in {"1", "true", "yes", "y", "on"}
@@ -78,29 +95,18 @@ OPENAI_RATELIMIT_LIMIT_REQUESTS = int(os.getenv("OPENAI_RATELIMIT_LIMIT_REQUESTS
 OPENAI_RATELIMIT_LIMIT_TOKENS = int(os.getenv("OPENAI_RATELIMIT_LIMIT_TOKENS", "999999"))
 OPENAI_RATELIMIT_RESET_SECONDS = int(os.getenv("OPENAI_RATELIMIT_RESET_SECONDS", "1"))
 
-HELIX_TOKEN_COMMAND = os.getenv("HELIX_TOKEN_COMMAND")
-HELIX_TOKEN_TIMEOUT_SECONDS = int(os.getenv("HELIX_TOKEN_TIMEOUT_SECONDS", "15"))
-HELIX_TOKEN_TTL_SECONDS = int(os.getenv("HELIX_TOKEN_TTL_SECONDS", "3300"))
-HELIX_CERT_FILE = os.getenv("HELIX_CERT_FILE") or os.getenv("HELIX_SSL_CERT_FILE") or os.getenv("HELIX_PEM_FILE")
-
 app = FastAPI(title=APP_TITLE, version="0.1.0")
 
-_client_cache: dict[str | None, Any] = {}
-_anthropic_client_cache: dict[tuple[str, str, str | None], Any] = {}
-_helix_token_cache: dict[str, Any] = {"token": None, "expires_at": 0.0}
-_client_meta: dict[str, Any] = {}  # tracks api_key for cached genai client
-
-
-@dataclass
-class ModelTarget:
-    provider: str  # "gemini" or "claude"
-    model: str
-    location: str | None = None
-    region: str | None = None
+_client: Any | None = None
+_client_lock = asyncio.Lock()
 
 
 def _openai_rate_limit_headers(*, status_code: int, retry_after_seconds: int | None = None) -> dict[str, str]:
-    reset_seconds = retry_after_seconds if isinstance(retry_after_seconds, int) and retry_after_seconds > 0 else OPENAI_RATELIMIT_RESET_SECONDS
+    reset_seconds = (
+        retry_after_seconds
+        if isinstance(retry_after_seconds, int) and retry_after_seconds > 0
+        else OPENAI_RATELIMIT_RESET_SECONDS
+    )
     remaining_requests = 0 if status_code == 429 else OPENAI_RATELIMIT_LIMIT_REQUESTS
     remaining_tokens = 0 if status_code == 429 else OPENAI_RATELIMIT_LIMIT_TOKENS
     reset_str = f"{reset_seconds}s"
@@ -160,153 +166,207 @@ def _google_api_key() -> str:
     return key
 
 
-def _apply_helix_cert_env() -> None:
-    if not HELIX_CERT_FILE:
-        return
-    for key in ("SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE"):
-        os.environ.setdefault(key, HELIX_CERT_FILE)
+# -----------------------------
+# NEW: Dual-mode client builder
+# -----------------------------
+
+def _auth_mode() -> str:
+    """
+    Determines how we authenticate to GenAI.
+    - personal: uses GOOGLE_API_KEY / GEMINI_API_KEY
+    - work: uses Helix token + optional internal endpoint / vertex parameters
+    """
+    mode = (os.getenv("GENAI_AUTH_MODE") or "personal").strip().lower()
+    if mode not in {"personal", "work"}:
+        mode = "personal"
+    return mode
 
 
-def _fetch_helix_token() -> tuple[str, float]:
-    if not HELIX_TOKEN_COMMAND:
-        raise RuntimeError("HELIX_TOKEN_COMMAND is not set")
-    _apply_helix_cert_env()
+def _helix_token() -> str:
+    """
+    Fetch a short-lived token from Helix CLI (or any internal tool).
+    Command must print a token to stdout.
+    """
+    cmd = (os.getenv("HELIX_TOKEN_COMMAND") or "").strip()
+    if not cmd:
+        raise HTTPException(
+            status_code=500,
+            detail="GENAI_AUTH_MODE=work but HELIX_TOKEN_COMMAND is not set.",
+        )
+
     try:
-        output = subprocess.check_output(
-            HELIX_TOKEN_COMMAND,
-            shell=True,
-            stderr=subprocess.STDOUT,
-            timeout=HELIX_TOKEN_TIMEOUT_SECONDS,
-            text=True,
-        ).strip()
-    except subprocess.CalledProcessError as exc:
-        message = (exc.output or "").strip()
-        raise RuntimeError(f"helix token command failed (exit {exc.returncode}): {message}") from exc
+        # Use shlex to support quoted args in env var
+        args = shlex.split(cmd)
+        proc = subprocess.run(args, capture_output=True, text=True, check=False)
     except Exception as exc:
-        raise RuntimeError(f"helix token command failed: {exc}") from exc
+        raise HTTPException(status_code=500, detail=f"Failed to run HELIX_TOKEN_COMMAND: {exc}") from exc
 
-    token = ""
-    expires_in: float | None = None
-    try:
-        data = json.loads(output)
-        if isinstance(data, dict):
-            token = str(data.get("access_token") or data.get("token") or "").strip()
-            expires_in = data.get("expires_in")
-    except Exception:
-        pass
+    if proc.returncode != 0:
+        stderr = (proc.stderr or "").strip()
+        raise HTTPException(
+            status_code=500,
+            detail=f"HELIX_TOKEN_COMMAND failed (rc={proc.returncode}): {stderr or 'no stderr'}",
+        )
 
+    token = (proc.stdout or "").strip()
     if not token:
-        token = output.splitlines()[0].strip()
-    if token.lower().startswith("bearer "):
-        token = token[7:].strip()
-    if not token:
-        raise RuntimeError("helix token command returned no token")
-
-    ttl = float(expires_in) if isinstance(expires_in, (int, float)) else float(HELIX_TOKEN_TTL_SECONDS)
-    # Refresh a bit early to avoid expiry mid-call.
-    expires_at = time.time() + max(30.0, ttl - 30.0)
-    return token, expires_at
-
-
-def _helix_api_key() -> str | None:
-    if not HELIX_TOKEN_COMMAND:
-        return None
-    now = time.time()
-    token = _helix_token_cache.get("token")
-    expires_at = _helix_token_cache.get("expires_at", 0.0) or 0.0
-    if token and now < expires_at:
-        return token
-    token, expires_at = _fetch_helix_token()
-    _helix_token_cache["token"] = token
-    _helix_token_cache["expires_at"] = expires_at
+        raise HTTPException(status_code=500, detail="HELIX_TOKEN_COMMAND returned empty stdout.")
     return token
 
 
-def _current_genai_api_key() -> str:
+def _filter_kwargs_for_client(kwargs: dict[str, Any]) -> dict[str, Any]:
+    """
+    Only pass kwargs that your installed google-genai Client accepts.
+    This keeps one script working across:
+      - personal machines (api_key only)
+      - corp installs (extra vertex/client_options/custom endpoint/etc.)
+    """
+    if genai is None:
+        return kwargs
+
     try:
-        token = _helix_api_key()
+        sig = inspect.signature(genai.Client)  # type: ignore[attr-defined]
     except Exception:
-        token = None
-        try:
-            token, expires_at = _fetch_helix_token()
-            _helix_token_cache["token"] = token
-            _helix_token_cache["expires_at"] = expires_at
-        except Exception:
-            token = None
-    return token or _google_api_key()
+        return kwargs
+
+    accepted = set(sig.parameters.keys())
+    return {k: v for k, v in kwargs.items() if k in accepted and v is not None}
 
 
-def _vertex_project_id() -> str:
-    project = os.getenv("VERTEX_PROJECT") or os.getenv("GOOGLE_CLOUD_PROJECT") or os.getenv("GOOGLE_PROJECT")
-    if not project:
-        raise HTTPException(
-            status_code=500,
-            detail="Missing Vertex project id (set VERTEX_PROJECT or GOOGLE_CLOUD_PROJECT).",
-        )
-    return project
-
-
-def _get_client(location: str | None = None) -> Any:
-    api_key = _current_genai_api_key()
-    cached = _client_cache.get("client")
-    cached_key = _client_meta.get("api_key")
-    if cached is not None and cached_key == api_key:
-        return cached
+def _build_personal_client() -> Any:
     if genai is None:
         raise HTTPException(
             status_code=500,
             detail="google-genai is not installed. Install with: pip install google-genai",
         )
-    client = genai.Client(api_key=api_key)
-    _client_cache["client"] = client
-    _client_meta["api_key"] = api_key
-    return client
+    kwargs = {"api_key": _google_api_key()}
+    kwargs = _filter_kwargs_for_client(kwargs)
+    if LOG_REQUESTS:
+        k = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY") or ""
+        print(f"Auth mode=personal; api_key_present={bool(k)}; api_key_suffix={k[-6:] if k else ''}")
+
+    return genai.Client(**kwargs)  # type: ignore[misc]
 
 
-def _get_anthropic_client(region: str) -> Any:
-    # Prefer Helix token (api_key) if available; otherwise use ADC credentials.
-    api_key = None
-    try:
-        api_key = _helix_api_key()
-    except Exception:
-        try:
-            token, expires_at = _fetch_helix_token()
-            _helix_token_cache["token"] = token
-            _helix_token_cache["expires_at"] = expires_at
-            api_key = token
-        except Exception:
-            api_key = None
-
-    cache_key = (_vertex_project_id(), region, api_key)
-    cached = _anthropic_client_cache.get(cache_key)
-    if cached is not None:
-        return cached
-
-    if AnthropicVertex is None:
+def _build_work_client() -> Any:
+    """
+    Work-mode client:
+      - gets token from Helix CLI
+      - optionally points to internal endpoint
+      - optionally uses vertexai=True with project/location if your environment needs it
+    """
+    if genai is None:
         raise HTTPException(
             status_code=500,
-            detail="anthropic>=0.37.0 is required for Vertex Claude. Install with: pip install anthropic",
+            detail="google-genai is not installed. Install with: pip install google-genai",
         )
 
-    client_kwargs: dict[str, Any] = {
-        "region": region,
-        "project_id": _vertex_project_id(),
-    }
-    if api_key:
-        client_kwargs["api_key"] = api_key
-    else:
-        if google is None:
-            raise HTTPException(status_code=500, detail="google-auth is required for Vertex Claude.")
-        try:
-            credentials, _ = google.auth.default()  # type: ignore[attr-defined]
-            client_kwargs["credentials"] = credentials
-        except Exception as exc:  # pragma: no cover
-            raise HTTPException(status_code=500, detail=f"Unable to load Google credentials: {exc}") from exc
+    token = _helix_token()
 
-    client = AnthropicVertex(**client_kwargs)
-    _anthropic_client_cache[cache_key] = client
-    return client
+    # Optional: internal endpoint override
+    endpoint = (os.getenv("GENAI_API_ENDPOINT") or "").strip()
+    client_options = None
+    if endpoint:
+        # Some google libs use "client_options={'api_endpoint': ...}"
+        # This may or may not be supported by google-genai.Client; we filter via signature.
+        client_options = {"api_endpoint": endpoint}
 
+    # Optional: Vertex routing/fields (common in corp setups)
+    vertexai_flag = (os.getenv("GENAI_VERTEXAI") or "").strip().lower() in {"1", "true", "yes", "y", "on"}
+    project = (os.getenv("GENAI_PROJECT") or "").strip() or None
+    location = (os.getenv("GENAI_LOCATION") or "").strip() or None
+
+    kwargs: dict[str, Any] = {}
+
+    # Many corp setups treat the short-lived token as the "api_key" value
+    # (even if it isn't literally a Google API key).
+    kwargs["api_key"] = token
+
+    # Vertex-specific flags (only applied if supported by your installed client)
+    kwargs["vertexai"] = vertexai_flag
+    kwargs["project"] = project
+    kwargs["location"] = location
+
+    # Endpoint override (only if supported)
+    kwargs["client_options"] = client_options
+
+    kwargs = _filter_kwargs_for_client(kwargs)
+
+    if LOG_REQUESTS:
+        safe = {k: ("***" if k in {"api_key"} else v) for k, v in kwargs.items()}
+        print("Initializing WORK GenAI client with kwargs:", safe)
+
+    return genai.Client(**kwargs)  # type: ignore[misc]
+
+
+def _get_client() -> Any:
+    global _client
+    if _client is not None:
+        return _client
+
+    mode = _auth_mode()
+    if mode == "work":
+        _client = _build_work_client()
+        return _client
+
+    _client = _build_personal_client()
+    return _client
+
+
+def _looks_like_expired_token_error(exc: Exception) -> bool:
+    msg = str(exc).lower()
+
+    needles = (
+        "unauthenticated",
+        "authentication failed",
+        "invalid authentication",
+        "invalid credentials",
+        "expired",
+        "token has expired",
+        "access token expired",
+        "permission denied",
+        "401",
+        "403",
+        "refresh",
+        "oauth",
+    )
+    if any(n in msg for n in needles):
+        return True
+
+    if genai_errors is not None:
+        status_code = getattr(exc, "status_code", None)
+        if status_code in (401, 403):
+            return True
+
+    return False
+
+
+async def _reset_client() -> Any:
+    global _client
+    async with _client_lock:
+        _client = None
+        return _get_client()
+
+
+async def _call_genai_with_reauth(fn, *, retry: bool = True):
+    """
+    Call a sync genai function in a threadpool.
+    If token/auth is expired, reset client and retry once.
+    """
+    try:
+        return await run_in_threadpool(fn)
+    except Exception as exc:
+        if retry and _looks_like_expired_token_error(exc):
+            if LOG_REQUESTS:
+                print("Auth/token failure detected; resetting GenAI client and retrying once:", repr(exc))
+            await _reset_client()
+            return await _call_genai_with_reauth(fn, retry=False)
+        raise
+
+
+# -----------------------------
+# Rest of your original helpers
+# -----------------------------
 
 def _estimate_tokens(text: str) -> int:
     if not text:
@@ -340,24 +400,6 @@ def _message_text(message: dict[str, Any]) -> str:
             )
         return "".join(parts)
     raise HTTPException(status_code=400, detail="Invalid message.content")
-
-
-def _messages_to_anthropic(messages: list[dict[str, Any]]) -> tuple[str | None, list[dict[str, Any]]]:
-    system_parts: list[str] = []
-    convo: list[dict[str, Any]] = []
-    for msg in messages:
-        if not isinstance(msg, dict):
-            continue
-        role = msg.get("role")
-        text = _message_text(msg)
-        if role == "system":
-            if text:
-                system_parts.append(text)
-            continue
-        if role in {"user", "assistant"}:
-            convo.append({"role": role, "content": text})
-    system_prompt = "\n".join(system_parts) if system_parts else None
-    return system_prompt, convo
 
 
 def _part_text(text: str) -> Any:
@@ -822,10 +864,6 @@ def _apply_tool_name_map_to_openai_tools(
 
 
 def _normalize_tool_choice(body: dict[str, Any]) -> Any:
-    # OpenAI format:
-    # - tool_choice: "none"|"auto"|"required"|{"type":"function","function":{"name":"..."}}
-    # Legacy:
-    # - function_call: "none"|"auto"|{"name":"..."}
     tool_choice = body.get("tool_choice")
     if tool_choice is None and "function_call" in body:
         tool_choice = body.get("function_call")
@@ -841,7 +879,6 @@ def _genai_tool_config(tool_choice: Any, *, allowed_names: list[str] | None) -> 
     elif tool_choice == "required":
         mode = "ANY"
     elif isinstance(tool_choice, dict):
-        # {"type":"function","function":{"name":"..."}}
         fn = tool_choice.get("function") if tool_choice.get("type") == "function" else tool_choice
         if isinstance(fn, dict) and isinstance(fn.get("name"), str):
             mode = "ANY"
@@ -983,7 +1020,6 @@ def _parse_retry_after_seconds(message: str) -> int | None:
     if not message:
         return None
 
-    # Google errors often contain RetryInfo: 'retryDelay': '11s'
     m = re.search(r"retryDelay[\"']\s*:\s*[\"'](\d+)s[\"']", message)
     if m:
         try:
@@ -991,7 +1027,6 @@ def _parse_retry_after_seconds(message: str) -> int | None:
         except Exception:
             return None
 
-    # Or: "Please retry in 11.47287309s."
     m = re.search(r"retry in\s+(\d+(?:\.\d+)?)s", message, flags=re.IGNORECASE)
     if m:
         try:
@@ -1000,27 +1035,6 @@ def _parse_retry_after_seconds(message: str) -> int | None:
             return None
 
     return None
-
-
-def _is_claude_model(model: str) -> bool:
-    m = model.lower()
-    return m.startswith("claude")
-
-
-def _is_gemini_model(model: str) -> bool:
-    m = model.lower()
-    return m.startswith("gemini") or "gemini" in m
-
-
-def _resolve_model_target(model: str) -> ModelTarget:
-    if _is_claude_model(model):
-        region = DEFAULT_VERTEX_REGION
-        if not region:
-            raise HTTPException(status_code=400, detail="Missing Vertex region for Claude models.")
-        return ModelTarget(provider="claude", model=model, region=region)
-    if _is_gemini_model(model):
-        return ModelTarget(provider="gemini", model=model, location=None)
-    raise HTTPException(status_code=400, detail=f"Unsupported model '{model}'.")
 
 
 def _maybe_handle_genai_error(exc: Exception) -> JSONResponse | None:
@@ -1070,7 +1084,6 @@ async def chat_completions(
     if not isinstance(body, dict):
         raise HTTPException(status_code=400, detail="Body must be a JSON object.")
     if LOG_REQUESTS:
-        # Avoid logging secrets by design: we don't expect keys in body.
         print("REQUEST /v1/chat/completions keys:", sorted(body.keys()))
         messages_preview = body.get("messages")
         if isinstance(messages_preview, list):
@@ -1108,12 +1121,11 @@ async def chat_completions(
     if not isinstance(model, str) or not model.strip():
         raise HTTPException(status_code=400, detail="model must be a non-empty string.")
     model = model.strip()
-    print(model)
+
     messages = body.get("messages")
     if not isinstance(messages, list):
         raise HTTPException(status_code=400, detail="messages must be an array.")
 
-    # Be permissive; many clients always send n.
     n = body.get("n", 1)
     try:
         n = int(n)
@@ -1149,79 +1161,6 @@ async def chat_completions(
     created = int(time.time())
     completion_id = f"chatcmpl-{uuid.uuid4().hex}"
 
-    target = _resolve_model_target(model)
-    model = target.model
-
-    if target.provider == "claude":
-        if stream:
-            raise HTTPException(status_code=400, detail="stream is not supported for Claude on Vertex yet.")
-        system_prompt, claude_messages = _messages_to_anthropic(messages)
-        try:
-            claude_client = _get_anthropic_client(region=target.region or DEFAULT_VERTEX_REGION)
-            claude_response = await run_in_threadpool(
-                lambda: claude_client.messages.create(
-                    model=target.model,
-                    messages=claude_messages,
-                    system=system_prompt,
-                    max_tokens=max_tokens or 256,
-                    temperature=temperature,
-                    top_p=top_p,
-                    stop_sequences=stop_sequences,
-                )
-            )
-        except HTTPException:
-            raise
-        except Exception as exc_first:  # pragma: no cover
-            # Retry once with a fresh client in case creds/token expired.
-            try:
-                _anthropic_client_cache.clear()
-                claude_client = _get_anthropic_client(region=target.region or DEFAULT_VERTEX_REGION)
-                claude_response = await run_in_threadpool(
-                    lambda: claude_client.messages.create(
-                        model=target.model,
-                        messages=claude_messages,
-                        system=system_prompt,
-                        max_tokens=max_tokens or 256,
-                        temperature=temperature,
-                        top_p=top_p,
-                        stop_sequences=stop_sequences,
-                    )
-                )
-            except Exception as exc_second:
-                raise HTTPException(status_code=500, detail=str(exc_second)) from exc_first
-
-        text_parts: list[str] = []
-        for part in getattr(claude_response, "content", []) or []:
-            if getattr(part, "type", None) == "text":
-                text_parts.append(getattr(part, "text", "") or "")
-        text = "".join(text_parts)
-        if not text:
-            text = "[empty response]"
-
-        prompt_text = "\n".join(_message_text(m) for m in messages if isinstance(m, dict))
-        usage = {
-            "prompt_tokens": _estimate_tokens(prompt_text),
-            "completion_tokens": _estimate_tokens(text),
-            "total_tokens": _estimate_tokens(prompt_text) + _estimate_tokens(text),
-        }
-
-        return JSONResponse(
-            {
-                "id": completion_id,
-                "object": "chat.completion",
-                "created": created,
-                "model": target.model,
-                "choices": [
-                    {
-                        "index": 0,
-                        "message": {"role": "assistant", "content": text},
-                        "finish_reason": "stop",
-                    }
-                ],
-                "usage": usage,
-            }
-        )
-
     openai_tools_raw = _normalize_openai_tools(body)
     if LOG_REQUESTS:
         print("REQUEST tools present:", bool(openai_tools_raw), "count:", len(openai_tools_raw or []))
@@ -1230,13 +1169,12 @@ async def chat_completions(
             names: list[str] = []
             for t in openai_tools_raw[:25]:
                 if isinstance(t, dict) and t.get("type") == "function" and isinstance(t.get("function"), dict):
-                    n = t["function"].get("name")
-                    if isinstance(n, str):
-                        names.append(n)
+                    n_ = t["function"].get("name")
+                    if isinstance(n_, str):
+                        names.append(n_)
             print("REQUEST tool names (first 25):", names)
+
     openai_to_genai, genai_to_openai = _build_tool_name_maps(openai_tools_raw)
-    if LOG_REQUESTS and openai_tools_raw:
-        print("TOOL name map size:", len(openai_to_genai))
     openai_tools_mapped = _apply_tool_name_map_to_openai_tools(openai_tools_raw, openai_to_genai)
     tools = _genai_tools(openai_tools_mapped)
 
@@ -1256,39 +1194,17 @@ async def chat_completions(
         tool_config=tool_config,
     )
 
-    client = _get_client(location=target.location)
-
     if stream:
-        # Streaming tool calls in OpenAI format requires incremental tool_call deltas.
-        # For Roo compatibility, if tools are present, do a single non-stream provider call
-        # and stream back a minimal chunk sequence.
         if tools:
             try:
-                print(model)
-                response = await run_in_threadpool(
-                    lambda: client.models.generate_content(model=model, contents=contents, config=config)
+                response = await _call_genai_with_reauth(
+                    lambda: _get_client().models.generate_content(model=model, contents=contents, config=config)
                 )
             except Exception as exc:
-                _client_cache.pop("client", None)
-                _client_meta.pop("api_key", None)
-                client = _get_client(location=target.location)
-                try:
-                    response = await run_in_threadpool(
-                        lambda: client.models.generate_content(model=model, contents=contents, config=config)
-                    )
-                except Exception as exc2:
-                    err = _maybe_handle_genai_error(exc2)
-                    if err is not None:
-                        return err
-                    raise
-            else:
-                pass
-            try:
                 err = _maybe_handle_genai_error(exc)
                 if err is not None:
                     return err
-            except UnboundLocalError:
-                pass
+                raise
 
             text = _extract_text(response)
             tool_calls = _extract_function_calls(response, genai_to_openai=genai_to_openai)
@@ -1344,9 +1260,24 @@ async def chat_completions(
 
             sent = ""
 
-            stream_fn = getattr(getattr(client, "models", None), "generate_content_stream", None)
-            if callable(stream_fn):
-                stream_iter: Iterable[Any] = stream_fn(model=model, contents=contents, config=config)
+            # Prefer provider streaming if present
+            def _make_stream_iter() -> Iterable[Any]:
+                c = _get_client()
+                stream_fn = getattr(getattr(c, "models", None), "generate_content_stream", None)
+                if not callable(stream_fn):
+                    raise RuntimeError("generate_content_stream not available")
+                return stream_fn(model=model, contents=contents, config=config)
+
+            try:
+                stream_iter = _make_stream_iter()
+            except Exception as exc:
+                if _looks_like_expired_token_error(exc):
+                    await _reset_client()
+                    stream_iter = _make_stream_iter()
+                else:
+                    stream_iter = None  # type: ignore[assignment]
+
+            if stream_iter is not None:
                 try:
                     async for chunk in iterate_in_threadpool(stream_iter):
                         chunk_text = _extract_text(chunk)
@@ -1366,66 +1297,26 @@ async def chat_completions(
                             }
                         )
                 except Exception as exc:  # pragma: no cover
-                    _client_cache.pop("client", None)
-                    _client_meta.pop("api_key", None)
-                    client_retry = _get_client(location=target.location)
-                    stream_fn_retry = getattr(getattr(client_retry, "models", None), "generate_content_stream", None)
-                    if callable(stream_fn_retry):
-                        try:
-                            stream_iter_retry: Iterable[Any] = stream_fn_retry(model=model, contents=contents, config=config)
-                            async for chunk in iterate_in_threadpool(stream_iter_retry):
-                                chunk_text = _extract_text(chunk)
-                                if not chunk_text:
-                                    continue
-                                delta = chunk_text[len(sent) :] if chunk_text.startswith(sent) else chunk_text
-                                sent = chunk_text if chunk_text.startswith(sent) else (sent + delta)
-                                if not delta:
-                                    continue
-                                yield _sse(
-                                    {
-                                        "id": completion_id,
-                                        "object": "chat.completion.chunk",
-                                        "created": created,
-                                        "model": model,
-                                        "choices": [{"index": 0, "delta": {"content": delta}, "finish_reason": None}],
-                                    }
-                                )
-                        except Exception as exc_retry:  # pragma: no cover
-                            err = _maybe_handle_genai_error(exc_retry)
-                            if err is None:
-                                raise
-                            yield _sse({"error": err.body.decode("utf-8") if hasattr(err, "body") else str(exc_retry)})
-                            yield "data: [DONE]\n\n"
-                            return
-                    else:
-                        err = _maybe_handle_genai_error(exc)
-                        if err is None:
-                            raise
-                        yield _sse({"error": err.body.decode("utf-8") if hasattr(err, "body") else str(exc)})
-                        yield "data: [DONE]\n\n"
-                        return
+                    err = _maybe_handle_genai_error(exc)
+                    if err is None:
+                        raise
+                    yield _sse({"error": err.body.decode("utf-8") if hasattr(err, "body") else str(exc)})
+                    yield "data: [DONE]\n\n"
+                    return
             else:
                 try:
-                    response = await run_in_threadpool(
-                        lambda: client.models.generate_content(model=model, contents=contents, config=config)
+                    response = await _call_genai_with_reauth(
+                        lambda: _get_client().models.generate_content(model=model, contents=contents, config=config)
                     )
                     full_text = _extract_text(response)
                 except Exception as exc:  # pragma: no cover
-                    _client_cache.pop("client", None)
-                    _client_meta.pop("api_key", None)
-                    client = _get_client(location=target.location)
-                    try:
-                        response = await run_in_threadpool(
-                            lambda: client.models.generate_content(model=model, contents=contents, config=config)
-                        )
-                        full_text = _extract_text(response)
-                    except Exception as exc_retry:  # pragma: no cover
-                        err = _maybe_handle_genai_error(exc_retry)
-                        if err is None:
-                            raise
-                        yield _sse({"error": err.body.decode("utf-8") if hasattr(err, "body") else str(exc_retry)})
-                        yield "data: [DONE]\n\n"
-                        return
+                    err = _maybe_handle_genai_error(exc)
+                    if err is None:
+                        raise
+                    yield _sse({"error": err.body.decode("utf-8") if hasattr(err, "body") else str(exc)})
+                    yield "data: [DONE]\n\n"
+                    return
+
                 chunk_size = 80
                 for i in range(0, len(full_text), chunk_size):
                     delta = full_text[i : i + chunk_size]
@@ -1453,22 +1344,15 @@ async def chat_completions(
         return StreamingResponse(event_stream(), media_type="text/event-stream")
 
     try:
-        response = await run_in_threadpool(
-            lambda: client.models.generate_content(model=model, contents=contents, config=config)
+        response = await _call_genai_with_reauth(
+            lambda: _get_client().models.generate_content(model=model, contents=contents, config=config)
         )
     except Exception as exc:
-        _client_cache.pop("client", None)
-        _client_meta.pop("api_key", None)
-        client = _get_client(location=target.location)
-        try:
-            response = await run_in_threadpool(
-                lambda: client.models.generate_content(model=model, contents=contents, config=config)
-            )
-        except Exception as exc_retry:
-            err = _maybe_handle_genai_error(exc_retry)
-            if err is not None:
-                return err
-            raise
+        err = _maybe_handle_genai_error(exc)
+        if err is not None:
+            return err
+        raise
+
     text = _extract_text(response)
     tool_calls = _extract_function_calls(response, genai_to_openai=genai_to_openai)
     parallel_tool_calls = body.get("parallel_tool_calls")
@@ -1489,7 +1373,6 @@ async def chat_completions(
             tool_names = [tc.get("function", {}).get("name") for tc in tool_calls if isinstance(tc, dict)]
             print("RESPONSE assistant tool_calls:", tool_names, "text_len:", len(text))
         if not text:
-            # Some clients (incl. agent orchestrators) treat empty content + tool calls as missing output.
             text = "Calling tool…"
         return JSONResponse(
             {
