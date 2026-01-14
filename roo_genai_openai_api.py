@@ -336,16 +336,50 @@ def _get_genai_client(*, location: str | None) -> Any:
         return c
 
     # work mode
-    token = _helix_token()
+        # work mode
     client_options = {"api_endpoint": endpoint} if endpoint else None
+    kwargs: dict[str, Any] = {}
 
-    kwargs: dict[str, Any] = {
-        "api_key": token,          # many corp setups use token in api_key slot
-        "vertexai": vertexai_flag,
-        "project": project,
-        "location": loc,
-        "client_options": client_options,
-    }
+    if vertexai_flag:
+        # Vertex mode: credentials + project + location ONLY
+        if not project or not loc:
+            raise HTTPException(
+                status_code=500,
+                detail="GENAI_VERTEXAI=1 requires GENAI_PROJECT and GENAI_LOCATION",
+            )
+
+        from google.auth.credentials import Credentials  # type: ignore
+
+        class HelixCredentials(Credentials):
+            def refresh(self, request):
+                self.token = _helix_token()
+
+            @property
+            def expired(self):
+                return False
+
+            @property
+            def valid(self):
+                return True
+
+        creds = HelixCredentials()
+        creds.token = _helix_token()
+
+        kwargs.update(
+            {
+                "vertexai": True,
+                "project": project,
+                "location": loc,
+                "credentials": creds,
+            }
+        )
+    else:
+        # Non-Vertex work mode (internal gateway pattern)
+        kwargs["api_key"] = _helix_token()
+
+    if client_options:
+        kwargs["client_options"] = client_options
+
     kwargs = _filter_kwargs_for_ctor(genai.Client, kwargs)
 
     if LOG_REQUESTS:
